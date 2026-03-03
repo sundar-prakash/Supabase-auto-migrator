@@ -17,6 +17,7 @@ OLD_SERVICE_ROLE_KEY = "-"
 NEW_API_URL = "https://[projectid].supabase.co"
 NEW_SERVICE_ROLE_KEY = "-"
 
+
 # ==========================================
 # 2. PERMISSIONS RESTORATION SQL
 # ==========================================
@@ -32,6 +33,8 @@ GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO postgres, service_role
 
 -- Grant privileges on all existing sequences in public schema
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO postgres, service_role, anon, authenticated;
+
+TRUNCATE TABLE storage.objects CASCADE;
 
 -- Apply default privileges for any newly created tables/functions/sequences
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO postgres, anon, authenticated, service_role;
@@ -83,9 +86,14 @@ def migrate_database():
         "-f auth_data.sql"
     ])
 
+    # run_command([
+    #     "pg_dump", f'"{OLD_DB_URL}"',
+    #     "--data-only", "--table=storage.buckets", "--table=storage.objects", "--column-inserts",
+    #     "-f storage_metadata.sql"
+    # ])
     run_command([
         "pg_dump", f'"{OLD_DB_URL}"',
-        "--data-only", "--table=storage.buckets", "--table=storage.objects", "--column-inserts",
+        "--data-only", "--table=storage.buckets", "--column-inserts",
         "-f storage_metadata.sql"
     ])
 
@@ -157,13 +165,23 @@ def migrate_storage_files():
                 try:
                     file_data = old_supabase.storage.from_(bucket_name).download(full_path)
                     print(f"  Uploading: {full_path}")
-                    new_supabase.storage.from_(bucket_name).upload(
-                        file=file_data, 
+                    
+                    # Perform the upload
+                    response = new_supabase.storage.from_(bucket_name).upload(
                         path=full_path, 
+                        file=file_data, 
                         file_options={"upsert": "true", "content-type": item.get('metadata', {}).get('mimetype', 'application/octet-stream')}
                     )
+                    
+                    # The Python SDK might return an error inside the response object instead of throwing an exception
+                    if isinstance(response, dict) and response.get('error'):
+                        print(f"❌ API Error: {response.get('error')}")
+                    else:
+                        print("  ✅ Upload successful!")
+
                 except Exception as e:
-                    print(f"❌ Error with file {full_path}: {e}")
+                    # This catches network drops or SDK crashes
+                    print(f"❌ Exception with file {full_path}: {e}")
 
     print("Fetching list of all buckets...")
     try:
@@ -188,6 +206,6 @@ def migrate_storage_files():
 # EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    migrate_database()
+    # migrate_database()
     migrate_storage_files()
     print("\n🎉 Full migration complete!")
