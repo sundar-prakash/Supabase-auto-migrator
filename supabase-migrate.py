@@ -18,7 +18,29 @@ NEW_API_URL = "https://[projectid].supabase.co"
 NEW_SERVICE_ROLE_KEY = "-"
 
 # ==========================================
-# 2. DATABASE MIGRATION (pg_dump & psql)
+# 2. PERMISSIONS RESTORATION SQL
+# ==========================================
+PERMISSIONS_SQL = """
+-- Restore usage on public schema
+GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;
+
+-- Grant privileges on all existing tables in public schema
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO postgres, service_role, anon, authenticated;
+
+-- Grant privileges on all existing functions in public schema
+GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO postgres, service_role, anon, authenticated;
+
+-- Grant privileges on all existing sequences in public schema
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO postgres, service_role, anon, authenticated;
+
+-- Apply default privileges for any newly created tables/functions/sequences
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO postgres, anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO postgres, anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO postgres, anon, authenticated, service_role;
+"""
+
+# ==========================================
+# 3. DATABASE MIGRATION (pg_dump & psql)
 # ==========================================
 def run_command(command_list):
     """Executes a shell command and streams the output."""
@@ -70,8 +92,17 @@ def migrate_database():
         "-f storage_metadata.sql"
     ])
 
+    print("\n--- RESTORING PERMISSIONS ---")
+    # Write permissions SQL to temp file and execute
+    with open("restore_permissions.sql", "w") as f:
+        f.write(PERMISSIONS_SQL)
+    
+    run_command(["psql", f'"{NEW_DB_URL}"', "-f restore_permissions.sql"])
+    os.remove("restore_permissions.sql")
+    print("✅ Permissions restored successfully!")
+
 # ==========================================
-# 3. PHYSICAL STORAGE MIGRATION
+# 4. PHYSICAL STORAGE MIGRATION
 # ==========================================
 def migrate_storage_files():
     print("\n--- STARTING PHYSICAL FILE MIGRATION ---")
