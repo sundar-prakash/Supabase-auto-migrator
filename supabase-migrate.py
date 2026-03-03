@@ -37,6 +37,19 @@ GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO postgres, service_role
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO postgres, anon, authenticated, service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO postgres, anon, authenticated, service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO postgres, anon, authenticated, service_role;
+
+-- Custom Hook Permissions
+-- Grant access to function to supabase_auth_admin
+-- GRANT EXECUTE ON FUNCTION public.custom_access_token_hook TO supabase_auth_admin;
+
+-- Grant access to schema to supabase_auth_admin
+-- GRANT USAGE ON SCHEMA public TO supabase_auth_admin;
+
+-- Revoke function permissions from authenticated, anon and public
+-- REVOKE EXECUTE ON FUNCTION public.custom_access_token_hook FROM authenticated, anon, public;
+
+-- Grant access to read the users table, which the hook queries explicitly.
+-- GRANT SELECT ON TABLE public.users TO supabase_auth_admin;
 """
 
 # ==========================================
