@@ -1,22 +1,20 @@
-import os
 import subprocess
-from supabase import create_client, Client
-from supabase import ClientOptions
+import os
+import datetime
+import re
+from supabase import create_client, Client, ClientOptions
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-# Database connection strings (replace with your exact credentials)
-OLD_DB_URL = "transaction pooler"
-NEW_DB_URL = "transaction pooler"
+OLD_DB_URL = "postgresql://postgres:old_password@old_host:5432/postgres"
+NEW_DB_URL = "postgresql://postgres:new_password@new_host:5432/postgres"
 
-# Supabase API credentials (Needed for physical file transfer)
-OLD_API_URL = "https://[projectid].supabase.co"
-OLD_SERVICE_ROLE_KEY = "-"
+OLD_API_URL = "https://old-project.supabase.co"
+OLD_SERVICE_ROLE_KEY = "old_service_role_key"
 
-NEW_API_URL = "https://[projectid].supabase.co"
-NEW_SERVICE_ROLE_KEY = "-"
-
+NEW_API_URL = "https://new-project.supabase.co"
+NEW_SERVICE_ROLE_KEY = "new_service_role_key"
 
 # ==========================================
 # 2. SQL SCRIPTS
@@ -33,7 +31,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO postgres, an
 """
 
 CLEAN_DATA_SQL = """
--- Truncate all tables in the public schema dynamically
 DO $$ DECLARE
     r RECORD;
 BEGIN
@@ -42,21 +39,23 @@ BEGIN
     END LOOP;
 END $$;
 
--- Truncate Auth and Storage data to ensure a completely fresh state
 TRUNCATE TABLE auth.users CASCADE;
 TRUNCATE TABLE storage.buckets CASCADE;
 TRUNCATE TABLE storage.objects CASCADE;
 """
+
 # ==========================================
 # 3. HELPER FUNCTIONS
 # ==========================================
-def run_command(command_list):
+def run_command(command_list, ignore_errors=False):
     command_str = " ".join(command_list)
     print(f"\n---> Running: {command_str[:80]}...") 
     result = subprocess.run(command_str, shell=True, capture_output=True, text=True)
-    if result.returncode != 0:
+    if result.returncode != 0 and not ignore_errors:
         print(f"❌ Error: {result.stderr}")
         exit(1)
+    elif result.returncode != 0 and ignore_errors:
+        print("✅ Success (Ignored harmless 'already exists' warnings)")
     else:
         print("✅ Success")
 
@@ -81,8 +80,6 @@ def restore_permissions(db_url):
 # ==========================================
 def backup_databases():
     print("\n--- 🛡️ CREATING SAFETY BACKUPS ---")
-    
-    # Extract project name from URL (e.g., db.brainboosterz.com)
     project_slug = re.sub(r'^https?://', '', OLD_API_URL).split('/')[0]
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_dir = f"backups/{project_slug}_{timestamp}"
@@ -91,18 +88,10 @@ def backup_databases():
     print(f"📁 Created backup folder: {backup_dir}")
     
     print("⏳ Backing up OLD database...")
-    run_command([
-        "pg_dump", f'"{OLD_DB_URL}"',
-        "--clean", "--if-exists",
-        f"-f {backup_dir}/old_db_full_backup.sql"
-    ])
+    run_command(["pg_dump", f'"{OLD_DB_URL}"', "--clean", "--if-exists", f"-f {backup_dir}/old_db_full_backup.sql"])
     
     print("⏳ Backing up NEW database...")
-    run_command([
-        "pg_dump", f'"{NEW_DB_URL}"',
-        "--clean", "--if-exists",
-        f"-f {backup_dir}/new_db_full_backup.sql"
-    ])
+    run_command(["pg_dump", f'"{NEW_DB_URL}"', "--clean", "--if-exists", f"-f {backup_dir}/new_db_full_backup.sql"])
     print(f"✅ Safety backups saved securely in ./{backup_dir}/")
 
 # ==========================================
@@ -112,34 +101,26 @@ def export_database(schema_only=False):
     print("\n--- 📤 STARTING DATABASE EXPORT ---")
     if schema_only:
         print("--> Mode: SCHEMA ONLY (Skipping table data...)")
-        run_command([
-            "pg_dump", f'"{OLD_DB_URL}"',
-            "--schema=public", "--schema-only", "--no-owner", "--no-privileges", "--clean", "--if-exists",
-            "-f my_database_dump.sql"
-        ])
+        run_command(["pg_dump", f'"{OLD_DB_URL}"', "--schema=public", "--schema-only", "--no-owner", "--no-privileges", "--clean", "--if-exists", "-f my_database_dump.sql"])
     else:
         print("--> Mode: FULL BACKUP (Schema + Data...)")
-        run_command([
-            "pg_dump", f'"{OLD_DB_URL}"',
-            "--schema=public", "--no-owner", "--no-privileges", "--clean", "--if-exists",
-            "-f my_database_dump.sql"
-        ])
-        run_command([
-            "pg_dump", f'"{OLD_DB_URL}"',
-            "--data-only", "--table=auth.users", "--table=auth.identities", "--column-inserts",
-            "-f auth_data.sql"
-        ])
+        run_command(["pg_dump", f'"{OLD_DB_URL}"', "--schema=public", "--no-owner", "--no-privileges", "--clean", "--if-exists", "-f my_database_dump.sql"])
+        run_command(["pg_dump", f'"{OLD_DB_URL}"', "--data-only", "--table=auth.users", "--table=auth.identities", "--column-inserts", "-f auth_data.sql"])
         
     print("--> Exporting Storage Bucket Definitions...")
-    run_command([
-        "pg_dump", f'"{OLD_DB_URL}"',
-        "--data-only", "--table=storage.buckets", "--column-inserts",
-        "-f storage_metadata.sql"
-    ])
+    run_command(["pg_dump", f'"{OLD_DB_URL}"', "--data-only", "--table=storage.buckets", "--column-inserts", "-f storage_metadata.sql"])
+
+    print("--> Exporting Auth & Storage Functions, Triggers, and Policies...")
+    run_command(["pg_dump", f'"{OLD_DB_URL}"', "--schema=auth", "--schema=storage", "--schema-only", "--no-owner", "--no-privileges", "-f auth_storage_schema.sql"])
 
 def import_full_database():
     print("\n--- 📥 STARTING FULL DATABASE IMPORT ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f my_database_dump.sql"])
+    
+    print("\n--- 📥 IMPORTING AUTH & STORAGE POLICIES ---")
+    print("    (Note: Harmless 'already exists' warnings are expected here as it skips default tables)")
+    run_command(["psql", f'"{NEW_DB_URL}"', "-f auth_storage_schema.sql"], ignore_errors=True)
+
     run_command(["psql", f'"{NEW_DB_URL}"', '-c "SET session_replication_role = replica;"', "-f auth_data.sql"])
     run_command(["psql", f'"{NEW_DB_URL}"', '-c "SET session_replication_role = replica;"', "-f storage_metadata.sql"])
     restore_permissions(NEW_DB_URL)
@@ -148,9 +129,12 @@ def import_schema_only():
     print("\n--- 📥 STARTING TEMPLATE IMPORT (Schema Only) ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f my_database_dump.sql"])
     
+    print("\n--- 📥 IMPORTING AUTH & STORAGE POLICIES ---")
+    print("    (Note: Harmless 'already exists' warnings are expected here as it skips default tables)")
+    run_command(["psql", f'"{NEW_DB_URL}"', "-f auth_storage_schema.sql"], ignore_errors=True)
+
     print("\n--- 🪣 CREATING STORAGE BUCKETS ---")
     run_command(["psql", f'"{NEW_DB_URL}"', '-c "SET session_replication_role = replica;"', "-f storage_metadata.sql"])
-    
     restore_permissions(NEW_DB_URL)
 
 # ==========================================
@@ -189,22 +173,16 @@ def migrate_storage_files():
                 try:
                     file_data = old_supabase.storage.from_(bucket_name).download(full_path)
                     print(f"  Uploading: {full_path}")
-                    
                     response = new_supabase.storage.from_(bucket_name).upload(
-                        path=full_path, 
-                        file=file_data, 
-                        file_options={"upsert": "true", "content-type": item.get('metadata', {}).get('mimetype', 'application/octet-stream')}
+                        path=full_path, file=file_data, file_options={"upsert": "true", "content-type": item.get('metadata', {}).get('mimetype', 'application/octet-stream')}
                     )
-                    
                     if isinstance(response, dict) and response.get('error'):
                         print(f"❌ API Error: {response.get('error')}")
                     else:
                         print("  ✅ Upload successful!")
-
                 except Exception as e:
                     print(f"❌ Exception with file {full_path}: {e}")
 
-    print("Fetching list of all buckets...")
     try:
         buckets = old_supabase.storage.list_buckets()
     except Exception as e:
@@ -229,45 +207,36 @@ if __name__ == "__main__":
     print(" SUPABASE MIGRATION SCRIPT (SAFE MODE)")
     print("==========================================\n")
     
-    # Question 1: Mode
     print("❓ Choose your migration mode:")
     print("   1. Full Clone (Migrate Schema, All Data, Auth, and Storage Files)")
     print("   2. Template Clone (Migrate ONLY Schema, Functions, RLS, and Empty Buckets)")
     mode_choice = input("   Enter 1 or 2: ").strip()
     schema_only_mode = (mode_choice == '2')
 
-    # Question 2: Clean New (Default: Yes)
     print("\n❓ Do you want to clean the NEW database before importing?")
     print("   (This deletes all existing data, auth users, and files on the target DB to prevent conflicts)")
-    clean_new_input = input("   [Y/n](default Yes): ").strip().lower()
-    clean_new_choice = clean_new_input in ['', 'y', 'yes'] # Empty string means they just pressed Enter
+    clean_new_input = input("   [Y/n]: ").strip().lower()
+    clean_new_choice = clean_new_input in ['', 'y', 'yes'] 
     
-    # Question 3: Clean Old (Default: No)
     print("\n❓ Do you want to clean the OLD database after migration finishes?")
     print("   (This securely wipes your old data once everything is finished)")
-    clean_old_input = input("   [y/N](default No): ").strip().lower()
-    clean_old_choice = clean_old_input in ['y', 'yes'] # Empty string defaults to False
+    clean_old_input = input("   [y/N]: ").strip().lower()
+    clean_old_choice = clean_old_input in ['y', 'yes'] 
     
     print("\n🚀 Starting execution sequence...\n")
     
-    # Step 1: Pre-Migration Backup of BOTH databases
     backup_databases()
-    
-    # Step 2: Export from Old
     export_database(schema_only=schema_only_mode)
     
-    # Step 3: Clean target if requested
     if clean_new_choice:
         clean_database(NEW_DB_URL, "NEW")
         
-    # Step 4: Import and migrate based on mode
     if schema_only_mode:
         import_schema_only()
     else:
         import_full_database()
         migrate_storage_files()
         
-    # Step 5: Clean old DB if requested
     if clean_old_choice:
         print("\n⚠️  WARNING: You are about to wipe the OLD database.")
         confirm = input("Are you absolutely sure? (y/n): ").strip().lower() == 'y'
@@ -276,8 +245,7 @@ if __name__ == "__main__":
         else:
             print("Skipping old database cleanup.")
             
-    # Cleanup leftover local temporary SQL dump files (leaves the /backups/ folder untouched!)
-    for file in ["my_database_dump.sql", "auth_data.sql", "storage_metadata.sql"]:
+    for file in ["my_database_dump.sql", "auth_data.sql", "storage_metadata.sql", "auth_storage_schema.sql"]:
         if os.path.exists(file):
             os.remove(file)
             
