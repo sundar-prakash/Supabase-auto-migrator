@@ -1,14 +1,20 @@
 # 🚀 Supabase Auto Migrator
 
-**A complete, one-click migration tool for Supabase projects.** Moving between Supabase accounts is notoriously tricky because of internal schemas, storage folder recursion, and Auth triggers. This Python tool automates the heavy lifting: it surgically exports your public data, injects your users safely, and recursively moves every single file in your Storage buckets—even those nested deep in subfolders.
+**A complete, interactive migration tool for Supabase projects.** Moving between Supabase accounts is notoriously tricky because of internal schemas, storage folder recursion, and Auth triggers. This Python tool automates the heavy lifting: it surgically exports your public data, injects your users safely, and recursively moves every single file in your Storage buckets—even those nested deep in subfolders.
 
 ## ✨ Key Features
 
-* **Database Schema & Data:** Surgically extracts the `public` schema while ignoring Supabase internal system tables.
+* **Interactive CLI Menu:** Choose your migration path and safety options via an easy-to-use terminal interface before execution begins.
+* **Two Migration Modes:**
+* **Full Clone:** Migrates your schema, all table data, Auth users, and recursively downloads/uploads every physical storage file.
+* **Template Clone:** Migrates ONLY your schema, functions, triggers, RLS policies, and empty storage bucket definitions. Perfect for spinning up fresh instances based on an existing architecture.
+
+
+* **Automatic Safety Backups:** Before running any destructive commands, the script automatically generates full `.sql` backups of *both* your old and new databases and saves them in a local, timestamped `backups/` folder.
+* **Target Database Cleaning:** Optionally auto-wipe the target (NEW) database's data, users, and files before importing to prevent unique constraint conflicts and guarantee a clean slate.
+* **Source Database Decommissioning:** Optionally securely wipe the source (OLD) database only after the migration has fully succeeded.
 * **Silent Auth Migration:** Transfers `auth.users` and `auth.identities` while temporarily disabling database triggers to prevent accidental "Welcome" emails to your users.
-* **Storage Metadata:** Syncs your bucket definitions and file object records.
-* **Recursive Storage Sync:** Downloads and uploads physical files from old buckets to new ones, automatically handling nested folder structures.
-* **Safety First:** Uses `replica` session roles during import to bypass foreign key constraints and triggers during the data population phase.
+* **Recursive Storage Sync:** Crawls through your old storage buckets and uploads every file to the new project, maintaining exact nested folder structures.
 
 ---
 
@@ -44,18 +50,18 @@ You will need four pieces of information for **both** the Old and New projects:
 
 | Credential | Where to find in Supabase Dashboard |
 | --- | --- |
-| **Transaction Pooler URL** | Settings > Database > Connection String > URI (Ensure it's the **Transaction** mode, port 6543 or 5432) |
+| **Database URL** | Settings > Database > Connection String > URI |
 | **API URL** | Settings > API > Project URL |
 | **Service Role Key** | Settings > API > `service_role` (secret) |
 
 ### 3. Update the Script
 
-Open `supabase-migrate.py` and fill in the `CONFIGURATION` section:
+Open the Python script and fill in the `CONFIGURATION` section at the top:
 
 ```python
 # Database connection strings
-OLD_DB_URL = "postgresql://postgres.[REF]:[PASS]@aws-0-[REG].pooler.supabase.com:6543/postgres"
-NEW_DB_URL = "postgresql://postgres.[REF]:[PASS]@aws-0-[REG].pooler.supabase.com:6543/postgres"
+OLD_DB_URL = "postgresql://postgres:[PASS]@old-host:5432/postgres"
+NEW_DB_URL = "postgresql://postgres:[PASS]@new-host:5432/postgres"
 
 # Supabase API credentials
 OLD_API_URL = "https://your-old-project.supabase.co"
@@ -77,18 +83,22 @@ python3 supabase-migrate.py
 
 ```
 
-### What the script does:
+### The Execution Flow:
 
-1. **Exports** three SQL files: `my_database_dump.sql` (Public schema), `auth_data.sql` (Users), and `storage_metadata.sql` (Buckets).
-2. **Imports** the public schema into the new project.
-3. **Imports** Auth and Storage records using `session_replication_role = replica` to ensure a smooth data injection.
-4. **Syncs Files:** Recursively crawls through your old storage buckets and uploads every file to the new project.
+1. **Prompts:** The script will ask you to select a migration mode (Full vs. Template) and whether you want to clean the New and/or Old databases.
+2. **Backups:** Automatically creates a timestamped folder (e.g., `backups/your-project_20260305_123000`) containing full raw dumps of both databases.
+3. **Clean (Optional):** Dynamically truncates tables, auth users, and storage objects on the target database if requested.
+4. **Export:** Generates temporary SQL files for your Public schema, Auth users, and Storage metadata based on your selected mode.
+5. **Import:** Injects the schema and records using `session_replication_role = replica` to temporarily bypass foreign key constraints and triggers.
+6. **Sync Files:** Uses the Supabase API to recursively migrate physical storage objects (if Full Clone mode is selected).
+7. **Restore:** Automatically reapplies correct RLS and usage permissions to the `public` schema.
+8. **Cleanup:** Removes temporary dump files and (optionally) wipes the old database.
 
 ---
 
 ## 🛠 Troubleshooting
 
-* **Permission Denied for Schema Public:** After migration, if your API fails, run this in the Supabase SQL Editor:
+* **Permission Denied for Schema Public:** The script attempts to restore permissions automatically, but if your API fails after migration, run this in your New Supabase SQL Editor:
 ```sql
 GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
 GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated, service_role;
@@ -97,8 +107,8 @@ GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role
 ```
 
 
-* **Relation Does Not Exist:** This often happens during the `--clean` phase of `psql` and is usually harmless if the tables are created successfully afterward.
-* **Timeouts:** If you have massive storage buckets, the script may take a while. Ensure your machine doesn't go to sleep during the process.
+* **Relation Does Not Exist:** This often happens during the `--clean` phase of `psql` and is harmless if the tables are created successfully afterward.
+* **Timeouts:** If you have massive storage buckets, the physical file migration may take a while. Ensure your machine doesn't go to sleep during the process.
 
 ---
 
