@@ -44,6 +44,17 @@ TRUNCATE TABLE storage.buckets CASCADE;
 TRUNCATE TABLE storage.objects CASCADE;
 """
 
+# NEW: This clears default Supabase policies so your custom ones can be imported without clashing
+PRE_IMPORT_SQL = """
+DO $$ DECLARE
+    p RECORD;
+BEGIN
+    FOR p IN (SELECT schemaname, tablename, policyname FROM pg_policies WHERE schemaname IN ('storage', 'auth')) LOOP
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', p.policyname, p.schemaname, p.tablename);
+    END LOOP;
+END $$;
+"""
+
 # ==========================================
 # 3. HELPER FUNCTIONS
 # ==========================================
@@ -74,6 +85,14 @@ def restore_permissions(db_url):
     run_command(["psql", f'"{db_url}"', "-f restore_permissions.sql"])
     os.remove("restore_permissions.sql")
     print("✅ Permissions restored successfully!")
+
+def clear_policy_collisions(db_url):
+    print("\n--- 🧹 CLEARING DEFAULT STORAGE/AUTH POLICIES TO PREVENT COLLISIONS ---")
+    with open("pre_import.sql", "w") as f:
+        f.write(PRE_IMPORT_SQL)
+    run_command(["psql", f'"{db_url}"', "-f pre_import.sql"])
+    os.remove("pre_import.sql")
+    print("✅ Policy namespace cleared successfully!")
 
 # ==========================================
 # 4. PRE-MIGRATION BACKUPS
@@ -117,8 +136,10 @@ def import_full_database():
     print("\n--- 📥 STARTING FULL DATABASE IMPORT ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f my_database_dump.sql"])
     
+    # NEW: Run the collision cleaner before importing policies
+    clear_policy_collisions(NEW_DB_URL)
+    
     print("\n--- 📥 IMPORTING AUTH & STORAGE POLICIES ---")
-    print("    (Note: Harmless 'already exists' warnings are expected here as it skips default tables)")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f auth_storage_schema.sql"], ignore_errors=True)
 
     run_command(["psql", f'"{NEW_DB_URL}"', '-c "SET session_replication_role = replica;"', "-f auth_data.sql"])
@@ -129,8 +150,10 @@ def import_schema_only():
     print("\n--- 📥 STARTING TEMPLATE IMPORT (Schema Only) ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f my_database_dump.sql"])
     
+    # NEW: Run the collision cleaner before importing policies
+    clear_policy_collisions(NEW_DB_URL)
+    
     print("\n--- 📥 IMPORTING AUTH & STORAGE POLICIES ---")
-    print("    (Note: Harmless 'already exists' warnings are expected here as it skips default tables)")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f auth_storage_schema.sql"], ignore_errors=True)
 
     print("\n--- 🪣 CREATING STORAGE BUCKETS ---")
