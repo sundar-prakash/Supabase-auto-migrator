@@ -44,7 +44,6 @@ TRUNCATE TABLE storage.buckets CASCADE;
 TRUNCATE TABLE storage.objects CASCADE;
 """
 
-# NEW: This clears default Supabase policies so your custom ones can be imported without clashing
 PRE_IMPORT_SQL = """
 DO $$ DECLARE
     p RECORD;
@@ -53,6 +52,21 @@ BEGIN
         EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', p.policyname, p.schemaname, p.tablename);
     END LOOP;
 END $$;
+"""
+
+# NEW: Dynamically reconstructs RLS policies for storage buckets and objects
+EXPORT_STORAGE_POLICIES_SQL = """
+SELECT 'ALTER TABLE storage.buckets ENABLE ROW LEVEL SECURITY;';
+SELECT 'ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;';
+
+SELECT
+    'CREATE POLICY ' || quote_ident(policyname) || ' ON ' || quote_ident(schemaname) || '.' || quote_ident(tablename) ||
+    ' AS ' || permissive || ' FOR ' || cmd ||
+    ' TO ' || array_to_string(roles, ', ') ||
+    COALESCE(' USING (' || qual || ')', '') ||
+    COALESCE(' WITH CHECK (' || with_check || ')', '') || ';'
+FROM pg_policies
+WHERE schemaname = 'storage' AND tablename IN ('buckets', 'objects');
 """
 
 # ==========================================
@@ -129,18 +143,29 @@ def export_database(schema_only=False):
     print("--> Exporting Storage Bucket Definitions...")
     run_command(["pg_dump", f'"{OLD_DB_URL}"', "--data-only", "--table=storage.buckets", "--column-inserts", "-f storage_metadata.sql"])
 
-    print("--> Exporting Auth & Storage Functions, Triggers, and Policies...")
+    print("--> Exporting Auth Schema (Functions & Triggers)...")
     run_command(["pg_dump", f'"{OLD_DB_URL}"', "--schema=auth", "--schema=storage", "--schema-only", "--no-owner", "--no-privileges", "-f auth_storage_schema.sql"])
+
+    # NEW: Exporting just the Storage Policies
+    print("--> Exporting Storage RLS Policies (Buckets & Objects)...")
+    with open("export_storage_policies_query.sql", "w") as f:
+        f.write(EXPORT_STORAGE_POLICIES_SQL)
+    # Using -t (tuples only) and -A (unaligned) to generate a clean SQL file
+    run_command(["psql", f'"{OLD_DB_URL}"', "-t", "-A", "-f export_storage_policies_query.sql", ">", "storage_rls_policies.sql"])
+    os.remove("export_storage_policies_query.sql")
 
 def import_full_database():
     print("\n--- 📥 STARTING FULL DATABASE IMPORT ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f my_database_dump.sql"])
     
-    # NEW: Run the collision cleaner before importing policies
     clear_policy_collisions(NEW_DB_URL)
     
-    print("\n--- 📥 IMPORTING AUTH & STORAGE POLICIES ---")
+    print("\n--- 📥 IMPORTING AUTH & STORAGE SCHEMAS ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f auth_storage_schema.sql"], ignore_errors=True)
+
+    # NEW: Import the extracted policies specifically
+    print("\n--- 📥 IMPORTING STORAGE RLS POLICIES ---")
+    run_command(["psql", f'"{NEW_DB_URL}"', "-f storage_rls_policies.sql"])
 
     run_command(["psql", f'"{NEW_DB_URL}"', '-c "SET session_replication_role = replica;"', "-f auth_data.sql"])
     run_command(["psql", f'"{NEW_DB_URL}"', '-c "SET session_replication_role = replica;"', "-f storage_metadata.sql"])
@@ -150,11 +175,14 @@ def import_schema_only():
     print("\n--- 📥 STARTING TEMPLATE IMPORT (Schema Only) ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f my_database_dump.sql"])
     
-    # NEW: Run the collision cleaner before importing policies
     clear_policy_collisions(NEW_DB_URL)
     
-    print("\n--- 📥 IMPORTING AUTH & STORAGE POLICIES ---")
+    print("\n--- 📥 IMPORTING AUTH & STORAGE SCHEMAS ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f auth_storage_schema.sql"], ignore_errors=True)
+
+    # NEW: Import the extracted policies specifically
+    print("\n--- 📥 IMPORTING STORAGE RLS POLICIES ---")
+    run_command(["psql", f'"{NEW_DB_URL}"', "-f storage_rls_policies.sql"])
 
     print("\n--- 🪣 CREATING STORAGE BUCKETS ---")
     run_command(["psql", f'"{NEW_DB_URL}"', '-c "SET session_replication_role = replica;"', "-f storage_metadata.sql"])
@@ -268,7 +296,8 @@ if __name__ == "__main__":
         else:
             print("Skipping old database cleanup.")
             
-    for file in ["my_database_dump.sql", "auth_data.sql", "storage_metadata.sql", "auth_storage_schema.sql"]:
+    # NEW: added 'storage_rls_policies.sql' to the cleanup list
+    for file in ["my_database_dump.sql", "auth_data.sql", "storage_metadata.sql", "auth_storage_schema.sql", "storage_rls_policies.sql"]:
         if os.path.exists(file):
             os.remove(file)
             
