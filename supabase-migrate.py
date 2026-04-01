@@ -10,10 +10,10 @@ from supabase import create_client, Client, ClientOptions
 OLD_DB_URL = "postgresql://postgres:old_password@old_host:5432/postgres"
 NEW_DB_URL = "postgresql://postgres:new_password@new_host:5432/postgres"
 
-OLD_API_URL = "https://old-project.supabase.co"
+OLD_API_URL = "https://ygncslvayrhaomlunidk.supabase.co"
 OLD_SERVICE_ROLE_KEY = "old_service_role_key"
 
-NEW_API_URL = "https://new-project.supabase.co"
+NEW_API_URL = "https://db.vybn.in"
 NEW_SERVICE_ROLE_KEY = "new_service_role_key"
 
 # ==========================================
@@ -54,7 +54,6 @@ BEGIN
 END $$;
 """
 
-# NEW: Dynamically reconstructs RLS policies for storage buckets and objects
 EXPORT_STORAGE_POLICIES_SQL = """
 SELECT 'ALTER TABLE storage.buckets ENABLE ROW LEVEL SECURITY;';
 SELECT 'ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;';
@@ -70,11 +69,73 @@ WHERE schemaname = 'storage' AND tablename IN ('buckets', 'objects');
 """
 
 # ==========================================
+# NEW: URL REPLACEMENT SQL
+# ==========================================
+def build_url_replacement_sql(old_url: str, new_url: str) -> str:
+    return f"""
+DO $$
+DECLARE
+    r        RECORD;
+    col      RECORD;
+    affected INTEGER;
+    old_url  TEXT := '{old_url}';
+    new_url  TEXT := '{new_url}';
+BEGIN
+    RAISE NOTICE '========= REPLACING OLD STORAGE URLs =========';
+
+    FOR r IN
+        SELECT table_schema, table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_type = 'BASE TABLE'
+    LOOP
+        FOR col IN
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = r.table_schema
+              AND table_name   = r.table_name
+              AND data_type IN ('text', 'character varying', 'json', 'jsonb')
+        LOOP
+            IF col.data_type IN ('json', 'jsonb') THEN
+                EXECUTE format(
+                    'UPDATE %I.%I
+                     SET %I = REPLACE(%I::text, $1, $2)::jsonb
+                     WHERE %I::text ILIKE $3',
+                    r.table_schema, r.table_name,
+                    col.column_name, col.column_name,
+                    col.column_name
+                )
+                USING old_url, new_url, '%' || old_url || '%';
+            ELSE
+                EXECUTE format(
+                    'UPDATE %I.%I
+                     SET %I = REPLACE(%I::text, $1, $2)
+                     WHERE %I ILIKE $3',
+                    r.table_schema, r.table_name,
+                    col.column_name, col.column_name,
+                    col.column_name
+                )
+                USING old_url, new_url, '%' || old_url || '%';
+            END IF;
+
+            GET DIAGNOSTICS affected = ROW_COUNT;
+            IF affected > 0 THEN
+                RAISE NOTICE 'Updated % rows  ->  %.%  |  column: %',
+                    affected, r.table_schema, r.table_name, col.column_name;
+            END IF;
+        END LOOP;
+    END LOOP;
+
+    RAISE NOTICE '========= URL REPLACEMENT COMPLETE =========';
+END $$;
+"""
+
+# ==========================================
 # 3. HELPER FUNCTIONS
 # ==========================================
 def run_command(command_list, ignore_errors=False):
     command_str = " ".join(command_list)
-    print(f"\n---> Running: {command_str[:80]}...") 
+    print(f"\n---> Running: {command_str[:80]}...")
     result = subprocess.run(command_str, shell=True, capture_output=True, text=True)
     if result.returncode != 0 and not ignore_errors:
         print(f"❌ Error: {result.stderr}")
@@ -109,6 +170,22 @@ def clear_policy_collisions(db_url):
     print("✅ Policy namespace cleared successfully!")
 
 # ==========================================
+# NEW: STEP 6B — URL REPLACEMENT
+# ==========================================
+def replace_storage_urls():
+    print("\n--- 🔗 REPLACING OLD STORAGE URLs IN NEW DATABASE ---")
+    print(f"    OLD: {OLD_API_URL}")
+    print(f"    NEW: {NEW_API_URL}")
+
+    sql = build_url_replacement_sql(OLD_API_URL, NEW_API_URL)
+    with open("replace_urls.sql", "w") as f:
+        f.write(sql)
+
+    run_command(["psql", f'"{NEW_DB_URL}"', "-f replace_urls.sql"])
+    os.remove("replace_urls.sql")
+    print("✅ Storage URL replacement complete!")
+
+# ==========================================
 # 4. PRE-MIGRATION BACKUPS
 # ==========================================
 def backup_databases():
@@ -116,13 +193,13 @@ def backup_databases():
     project_slug = re.sub(r'^https?://', '', OLD_API_URL).split('/')[0]
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_dir = f"backups/{project_slug}_{timestamp}"
-    
+
     os.makedirs(backup_dir, exist_ok=True)
     print(f"📁 Created backup folder: {backup_dir}")
-    
+
     print("⏳ Backing up OLD database...")
     run_command(["pg_dump", f'"{OLD_DB_URL}"', "--clean", "--if-exists", f"-f {backup_dir}/old_db_full_backup.sql"])
-    
+
     print("⏳ Backing up NEW database...")
     run_command(["pg_dump", f'"{NEW_DB_URL}"', "--clean", "--if-exists", f"-f {backup_dir}/new_db_full_backup.sql"])
     print(f"✅ Safety backups saved securely in ./{backup_dir}/")
@@ -139,31 +216,28 @@ def export_database(schema_only=False):
         print("--> Mode: FULL BACKUP (Schema + Data...)")
         run_command(["pg_dump", f'"{OLD_DB_URL}"', "--schema=public", "--no-owner", "--no-privileges", "--clean", "--if-exists", "-f my_database_dump.sql"])
         run_command(["pg_dump", f'"{OLD_DB_URL}"', "--data-only", "--table=auth.users", "--table=auth.identities", "--column-inserts", "-f auth_data.sql"])
-        
+
     print("--> Exporting Storage Bucket Definitions...")
     run_command(["pg_dump", f'"{OLD_DB_URL}"', "--data-only", "--table=storage.buckets", "--column-inserts", "-f storage_metadata.sql"])
 
     print("--> Exporting Auth Schema (Functions & Triggers)...")
     run_command(["pg_dump", f'"{OLD_DB_URL}"', "--schema=auth", "--schema=storage", "--schema-only", "--no-owner", "--no-privileges", "-f auth_storage_schema.sql"])
 
-    # NEW: Exporting just the Storage Policies
     print("--> Exporting Storage RLS Policies (Buckets & Objects)...")
     with open("export_storage_policies_query.sql", "w") as f:
         f.write(EXPORT_STORAGE_POLICIES_SQL)
-    # Using -t (tuples only) and -A (unaligned) to generate a clean SQL file
     run_command(["psql", f'"{OLD_DB_URL}"', "-t", "-A", "-f export_storage_policies_query.sql", ">", "storage_rls_policies.sql"])
     os.remove("export_storage_policies_query.sql")
 
 def import_full_database():
     print("\n--- 📥 STARTING FULL DATABASE IMPORT ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f my_database_dump.sql"])
-    
+
     clear_policy_collisions(NEW_DB_URL)
-    
+
     print("\n--- 📥 IMPORTING AUTH & STORAGE SCHEMAS ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f auth_storage_schema.sql"], ignore_errors=True)
 
-    # NEW: Import the extracted policies specifically
     print("\n--- 📥 IMPORTING STORAGE RLS POLICIES ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f storage_rls_policies.sql"])
 
@@ -171,22 +245,27 @@ def import_full_database():
     run_command(["psql", f'"{NEW_DB_URL}"', '-c "SET session_replication_role = replica;"', "-f storage_metadata.sql"])
     restore_permissions(NEW_DB_URL)
 
+    # ✅ NEW STEP: Replace old URLs with new URLs after import
+    replace_storage_urls()
+
 def import_schema_only():
     print("\n--- 📥 STARTING TEMPLATE IMPORT (Schema Only) ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f my_database_dump.sql"])
-    
+
     clear_policy_collisions(NEW_DB_URL)
-    
+
     print("\n--- 📥 IMPORTING AUTH & STORAGE SCHEMAS ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f auth_storage_schema.sql"], ignore_errors=True)
 
-    # NEW: Import the extracted policies specifically
     print("\n--- 📥 IMPORTING STORAGE RLS POLICIES ---")
     run_command(["psql", f'"{NEW_DB_URL}"', "-f storage_rls_policies.sql"])
 
     print("\n--- 🪣 CREATING STORAGE BUCKETS ---")
     run_command(["psql", f'"{NEW_DB_URL}"', '-c "SET session_replication_role = replica;"', "-f storage_metadata.sql"])
     restore_permissions(NEW_DB_URL)
+
+    # ✅ NEW STEP: Replace old URLs with new URLs after schema import
+    replace_storage_urls()
 
 # ==========================================
 # 6. PHYSICAL STORAGE MIGRATION
@@ -196,7 +275,7 @@ def migrate_storage_files():
     if OLD_API_URL.startswith("postgresql://") or NEW_API_URL.startswith("postgresql://"):
         print("❌ CRITICAL ERROR: API URLs are formatted as database connections.")
         return
-        
+
     custom_options = ClientOptions(postgrest_client_timeout=60, storage_client_timeout=60)
     old_supabase: Client = create_client(OLD_API_URL, OLD_SERVICE_ROLE_KEY, options=custom_options)
     new_supabase: Client = create_client(NEW_API_URL, NEW_SERVICE_ROLE_KEY, options=custom_options)
@@ -212,10 +291,10 @@ def migrate_storage_files():
             item_name = item['name']
             if item_name == '.emptyFolderPlaceholder':
                 continue
-                
+
             full_path = f"{current_path}/{item_name}" if current_path else item_name
             is_folder = item.get('id') is None
-            
+
             if is_folder:
                 print(f"\n📁 Entering folder: {full_path}")
                 process_directory(bucket_name, full_path)
@@ -225,7 +304,8 @@ def migrate_storage_files():
                     file_data = old_supabase.storage.from_(bucket_name).download(full_path)
                     print(f"  Uploading: {full_path}")
                     response = new_supabase.storage.from_(bucket_name).upload(
-                        path=full_path, file=file_data, file_options={"upsert": "true", "content-type": item.get('metadata', {}).get('mimetype', 'application/octet-stream')}
+                        path=full_path, file=file_data,
+                        file_options={"upsert": "true", "content-type": item.get('metadata', {}).get('mimetype', 'application/octet-stream')}
                     )
                     if isinstance(response, dict) and response.get('error'):
                         print(f"❌ API Error: {response.get('error')}")
@@ -257,7 +337,7 @@ if __name__ == "__main__":
     print("==========================================")
     print(" SUPABASE MIGRATION SCRIPT (SAFE MODE)")
     print("==========================================\n")
-    
+
     print("❓ Choose your migration mode:")
     print("   1. Full Clone (Migrate Schema, All Data, Auth, and Storage Files)")
     print("   2. Template Clone (Migrate ONLY Schema, Functions, RLS, and Empty Buckets)")
@@ -267,27 +347,27 @@ if __name__ == "__main__":
     print("\n❓ Do you want to clean the NEW database before importing?")
     print("   (This deletes all existing data, auth users, and files on the target DB to prevent conflicts)")
     clean_new_input = input("   [Y/n]: ").strip().lower()
-    clean_new_choice = clean_new_input in ['', 'y', 'yes'] 
-    
+    clean_new_choice = clean_new_input in ['', 'y', 'yes']
+
     print("\n❓ Do you want to clean the OLD database after migration finishes?")
     print("   (This securely wipes your old data once everything is finished)")
     clean_old_input = input("   [y/N]: ").strip().lower()
-    clean_old_choice = clean_old_input in ['y', 'yes'] 
-    
+    clean_old_choice = clean_old_input in ['y', 'yes']
+
     print("\n🚀 Starting execution sequence...\n")
-    
+
     backup_databases()
     export_database(schema_only=schema_only_mode)
-    
+
     if clean_new_choice:
         clean_database(NEW_DB_URL, "NEW")
-        
+
     if schema_only_mode:
-        import_schema_only()
+        import_schema_only()          # ← replace_storage_urls() called inside
     else:
-        import_full_database()
+        import_full_database()        # ← replace_storage_urls() called inside
         migrate_storage_files()
-        
+
     if clean_old_choice:
         print("\n⚠️  WARNING: You are about to wipe the OLD database.")
         confirm = input("Are you absolutely sure? (y/n): ").strip().lower() == 'y'
@@ -295,10 +375,10 @@ if __name__ == "__main__":
             clean_database(OLD_DB_URL, "OLD")
         else:
             print("Skipping old database cleanup.")
-            
-    # NEW: added 'storage_rls_policies.sql' to the cleanup list
-    for file in ["my_database_dump.sql", "auth_data.sql", "storage_metadata.sql", "auth_storage_schema.sql", "storage_rls_policies.sql"]:
+
+    for file in ["my_database_dump.sql", "auth_data.sql", "storage_metadata.sql",
+                 "auth_storage_schema.sql", "storage_rls_policies.sql", "replace_urls.sql"]:
         if os.path.exists(file):
             os.remove(file)
-            
+
     print("\n🎉 Migration sequence complete! Your original states are saved in the 'backups' folder.")
